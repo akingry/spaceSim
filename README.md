@@ -4,14 +4,16 @@ A local Earth-centered 3D star viewer built from the **Hipparcos New Reduction**
 
 ## What this project does
 
-This project takes Hipparcos astrometric catalog data, converts the stars into 3D Cartesian positions centered on the Earth/Solar System observing location used by the catalog, stores the result in a local SQLite database, and renders the stars as white points in a fullscreen viewer.
+This project takes Hipparcos astrometric catalog data, converts the stars into 3D Cartesian positions centered on the Earth/Solar System observing location used by the catalog, stores the result in a local SQLite database, and renders the stars in a fullscreen interactive sky viewer.
 
 Current viewer features:
 - Fullscreen starfield viewer
-- Mouse-look camera
-- Stars rendered as white points on a black background
+- Mouse-look camera with stable no-roll sky-view behavior
+- Temperature-derived per-star RGB color
 - Magnitude cutoff control with `[` and `]`
+- Default visible magnitude limit of **9.0**
 - Brighter stars rendered larger and more opaque than dimmer stars
+- Faint galactic reference overlay: galactic equator plus north/south galactic pole markers
 - Data filtered to a higher-confidence 3D subset for position rendering
 
 ## Source data
@@ -106,6 +108,8 @@ The `stars` table includes parsed numeric helper fields such as:
 - `has_valid_3d`
 - `excluded_from_3d`
 - `exclusion_reason`
+- `temperature_k`
+- `color_r`, `color_g`, `color_b`
 
 ### How 3D coordinates were computed
 The coordinates are derived from:
@@ -173,6 +177,27 @@ Current decoded counts:
 - `hip9p`: **104** rows
 - `hipvim`: **25** rows
 
+## Color and temperature derivation
+
+### Temperature
+A derived stellar temperature column was added to the database:
+- `temperature_k`
+
+This is computed from `bv_num` using the Ballesteros approximation:
+- `T = 4600 * (1 / (0.92*(B-V) + 1.7) + 1 / (0.92*(B-V) + 0.62))`
+
+This gives an approximate effective temperature in Kelvin from the `B-V` color index.
+
+### RGB color
+Derived color channels were then added:
+- `color_r`
+- `color_g`
+- `color_b`
+
+These are computed from `temperature_k` using a standard blackbody/color-temperature approximation and stored as normalized floating-point values from `0.0` to `1.0`.
+
+This means the viewer can tint each star according to an approximate physically-motivated stellar color rather than rendering everything as pure white.
+
 ## How the viewer works
 
 ### Entry point
@@ -188,10 +213,12 @@ The viewer:
 - uses `moderngl` for GPU-based rendering
 - reads valid stars from `hipparcos.db`
 - uses `hpmag_num` to control visibility and visual styling
-- uses a mouse-look camera centered at the origin
+- uses `color_r`, `color_g`, `color_b` for per-star color
+- uses a stable no-roll mouse-look camera centered at the origin
+- draws a subtle galactic reference overlay
 
 ### Magnitude visibility control
-The viewer starts with magnitude limit **5.0**.
+The viewer starts with magnitude limit **9.0**.
 
 Controls:
 - `]` increases the visible magnitude limit (shows dimmer stars too)
@@ -206,6 +233,17 @@ The viewer uses `hpmag_num` to map stars visually:
 
 The magnitude range is clamped and compressed for visual clarity so the display is more useful than a literal raw mapping.
 
+### Color styling
+The viewer uses the derived database RGB values so stars are tinted by estimated stellar color/temperature.
+
+### Galactic reference overlay
+The viewer also draws a very subtle dark-blue galactic reference overlay consisting of:
+- the galactic equator
+- a north galactic pole marker
+- a south galactic pole marker
+
+These are intentionally faint so they help orient the viewer without dominating the star field.
+
 ## Main dependencies
 This project currently depends on Python packages available in the local environment, including:
 - `numpy`
@@ -218,12 +256,12 @@ This project currently depends on Python packages available in the local environ
 This is currently a visualization-first build, not a full scientific analysis pipeline. Some choices are intentionally practical for rendering:
 - limiting to a higher-confidence 3D subset
 - compressing brightness visually
-- rendering all stars as white for now
+- using temperature-derived approximate RGB values rather than a full spectral rendering model
 - using Earth-centered apparent magnitudes for display
 
 ## Suggested future improvements
 - add an on-screen HUD for current magnitude limit
-- add color from `B-V` or `V-I`
+- improve the galactic guide overlay labels / markers
 - add labels or info on selected stars
 - allow free movement through space
 - add LOD / precomputed magnitude tiers for even faster updates

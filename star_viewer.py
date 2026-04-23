@@ -11,7 +11,7 @@ from pyrr import Matrix44
 DB_PATH = Path(r"D:\OC\spaceSim\hipparcos.db")
 MAX_STARS = 60000
 MOUSE_SENSITIVITY = 0.12
-INITIAL_MAG_LIMIT = 5.0
+INITIAL_MAG_LIMIT = 9.0
 MIN_MAG_LIMIT = -2.0
 MAX_MAG_LIMIT = 14.0
 VISIBLE_MAG_MIN = -1.5
@@ -50,17 +50,40 @@ void main() {
 }
 """
 
+LINE_VERTEX_SHADER = """
+#version 330
+uniform mat4 u_projection;
+uniform mat4 u_view;
+in vec3 in_position;
+in vec4 in_color;
+out vec4 v_color;
+void main() {
+    gl_Position = u_projection * u_view * vec4(in_position, 1.0);
+    v_color = in_color;
+}
+"""
+
+LINE_FRAGMENT_SHADER = """
+#version 330
+in vec4 v_color;
+out vec4 f_color;
+void main() {
+    f_color = v_color;
+}
+"""
+
 
 def load_star_data(limit=MAX_STARS):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     rows = cur.execute(
         """
-        SELECT x, y, z, hpmag_num
+        SELECT x, y, z, hpmag_num, color_r, color_g, color_b
         FROM stars
         WHERE has_valid_3d = 1
           AND x IS NOT NULL AND y IS NOT NULL AND z IS NOT NULL
           AND hpmag_num IS NOT NULL
+          AND color_r IS NOT NULL AND color_g IS NOT NULL AND color_b IS NOT NULL
         ORDER BY hpmag_num ASC
         LIMIT ?
         """,
@@ -74,55 +97,64 @@ def load_star_data(limit=MAX_STARS):
 
     positions = arr[:, :3]
     magnitudes = arr[:, 3]
+    base_colors = arr[:, 4:7]
 
     radii = np.linalg.norm(positions, axis=1)
     finite = radii[np.isfinite(radii) & (radii > 0)]
     median_r = float(np.median(finite)) if len(finite) else 1.0
     scale = 30.0 / median_r if median_r > 0 else 1.0
     positions *= scale
-    return np.ascontiguousarray(positions), np.ascontiguousarray(magnitudes)
+    return np.ascontiguousarray(positions), np.ascontiguousarray(magnitudes), np.ascontiguousarray(base_colors)
 
 
-def style_from_magnitude(magnitudes):
+def style_from_magnitude(magnitudes, base_colors):
     mags = np.clip(magnitudes, VISIBLE_MAG_MIN, VISIBLE_MAG_MAX)
     t = (VISIBLE_MAG_MAX - mags) / (VISIBLE_MAG_MAX - VISIBLE_MAG_MIN)
     t = np.clip(t, 0.0, 1.0)
     boosted = np.power(t, 0.6)
     point_sizes = POINT_SIZE_MIN + boosted * (POINT_SIZE_MAX - POINT_SIZE_MIN)
     alphas = ALPHA_MIN + boosted * (ALPHA_MAX - ALPHA_MIN)
+    rgb = np.clip(base_colors, 0.0, 1.0).astype('f4')
     colors = np.column_stack([
-        np.ones_like(alphas),
-        np.ones_like(alphas),
-        np.ones_like(alphas),
+        rgb[:, 0],
+        rgb[:, 1],
+        rgb[:, 2],
         alphas,
     ]).astype('f4')
     return point_sizes.astype('f4'), colors
+
+
+def normalize(v):
+    n = np.linalg.norm(v)
+    if n == 0:
+        return v
+    return v / n
 
 
 def camera_matrix(yaw_deg, pitch_deg):
     yaw = math.radians(yaw_deg)
     pitch = math.radians(pitch_deg)
 
-    cy = math.cos(yaw)
-    sy = math.sin(yaw)
-    cp = math.cos(pitch)
-    sp = math.sin(pitch)
-
-    yaw_mat = np.array([
-        [cy, 0.0, -sy, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [sy, 0.0, cy, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
+    world_up = np.array([0.0, 1.0, 0.0], dtype='f4')
+    forward = np.array([
+        math.sin(yaw) * math.cos(pitch),
+        math.sin(pitch),
+        -math.cos(yaw) * math.cos(pitch),
     ], dtype='f4')
+    forward = normalize(forward)
 
-    pitch_mat = np.array([
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, cp, sp, 0.0],
-        [0.0, -sp, cp, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
+    right = normalize(np.cross(forward, world_up))
+    if np.linalg.norm(right) < 1e-6:
+        right = np.array([1.0, 0.0, 0.0], dtype='f4')
+    up = normalize(np.cross(right, forward))
+
+    view = np.array([
+        [right[0], up[0], -forward[0], 0.0],
+        [right[1], up[1], -forward[1], 0.0],
+        [right[2], up[2], -forward[2], 0.0],
+        [0.0,      0.0,    0.0,         1.0],
     ], dtype='f4')
-
-    return pitch_mat @ yaw_mat
+    return view
 
 
 def build_interleaved(positions, colors, sizes):
@@ -133,9 +165,64 @@ def build_interleaved(positions, colors, sizes):
     ])
 
 
+def galactic_to_cartesian(lon_deg, lat_deg, radius=60.0):
+    lon = math.radians(lon_deg)
+    lat = math.radians(lat_deg)
+    x = radius * math.cos(lat) * math.cos(lon)
+    y = radius * math.sin(lat)
+    z = radius * math.cos(lat) * math.sin(lon)
+    return [x, y, z]
+
+
+def build_guide_geometry():
+    color = np.array([0.12, 0.20, 0.42, 0.28], dtype='f4')
+
+    equator_pts = []
+    equator_cols = []
+    for lon in range(0, 361, 2):
+        equator_pts.append(galactic_to_cartesian(lon, 0.0))
+        equator_cols.append(color)
+    equator_data = np.hstack([
+        np.array(equator_pts, dtype='f4'),
+        np.array(equator_cols, dtype='f4'),
+    ])
+
+    pole_ring_pts = []
+    pole_ring_cols = []
+    for lat_sign in (1.0, -1.0):
+        pole_lat = 90.0 * lat_sign
+        ring_lat = 84.0 * lat_sign
+        prev = None
+        first = None
+        for lon in range(0, 361, 12):
+            p = galactic_to_cartesian(lon, ring_lat)
+            if first is None:
+                first = p
+            if prev is not None:
+                pole_ring_pts.extend([prev, p])
+                pole_ring_cols.extend([color, color])
+            prev = p
+        pole = galactic_to_cartesian(0.0, pole_lat)
+        pole_ring_pts.extend([
+            pole,
+            galactic_to_cartesian(0.0, ring_lat),
+            pole,
+            galactic_to_cartesian(120.0, ring_lat),
+            pole,
+            galactic_to_cartesian(240.0, ring_lat),
+        ])
+        pole_ring_cols.extend([color] * 6)
+
+    pole_data = np.hstack([
+        np.array(pole_ring_pts, dtype='f4'),
+        np.array(pole_ring_cols, dtype='f4'),
+    ])
+    return equator_data.astype('f4'), pole_data.astype('f4')
+
+
 def main():
-    positions, magnitudes = load_star_data()
-    point_sizes, colors = style_from_magnitude(magnitudes)
+    positions, magnitudes, base_colors = load_star_data()
+    point_sizes, colors = style_from_magnitude(magnitudes, base_colors)
 
     pygame.init()
     pygame.display.set_caption(f"Hipparcos Star Viewer - mag <= {INITIAL_MAG_LIMIT:.1f}")
@@ -151,6 +238,7 @@ def main():
     ctx.clear(0.0, 0.0, 0.0, 1.0)
 
     prog = ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
+    line_prog = ctx.program(vertex_shader=LINE_VERTEX_SHADER, fragment_shader=LINE_FRAGMENT_SHADER)
 
     visible = magnitudes <= INITIAL_MAG_LIMIT
     current_data = build_interleaved(positions[visible], colors[visible], point_sizes[visible])
@@ -160,8 +248,22 @@ def main():
         [(vbo, '3f 4f 1f', 'in_position', 'in_color', 'in_size')],
     )
 
+    equator_data, pole_data = build_guide_geometry()
+    equator_vbo = ctx.buffer(equator_data.tobytes())
+    pole_vbo = ctx.buffer(pole_data.tobytes())
+    equator_vao = ctx.vertex_array(
+        line_prog,
+        [(equator_vbo, '3f 4f', 'in_position', 'in_color')],
+    )
+    pole_vao = ctx.vertex_array(
+        line_prog,
+        [(pole_vbo, '3f 4f', 'in_position', 'in_color')],
+    )
+
     projection = Matrix44.perspective_projection(75.0, info.current_w / max(info.current_h, 1), 0.01, 1000.0, dtype='f4')
-    prog['u_projection'].write(projection.astype('f4').tobytes())
+    proj_bytes = projection.astype('f4').tobytes()
+    prog['u_projection'].write(proj_bytes)
+    line_prog['u_projection'].write(proj_bytes)
 
     pygame.event.set_grab(True)
     pygame.mouse.set_visible(False)
@@ -191,7 +293,7 @@ def main():
 
         mx, my = pygame.mouse.get_rel()
         yaw = (yaw + mx * MOUSE_SENSITIVITY) % 360.0
-        pitch = (pitch + my * MOUSE_SENSITIVITY) % 360.0
+        pitch = max(-89.9, min(89.9, pitch - my * MOUSE_SENSITIVITY))
 
         visible = magnitudes <= mag_limit
         visible_count = int(np.count_nonzero(visible))
@@ -202,13 +304,22 @@ def main():
             last_visible_count = visible_count
 
         view = camera_matrix(yaw, pitch)
-        prog['u_view'].write(view.astype('f4').tobytes())
+        view_bytes = view.astype('f4').tobytes()
+        prog['u_view'].write(view_bytes)
+        line_prog['u_view'].write(view_bytes)
 
         ctx.clear(0.0, 0.0, 0.0, 1.0)
+        equator_vao.render(mode=moderngl.LINE_STRIP)
+        pole_vao.render(mode=moderngl.LINES)
         if last_visible_count > 0:
             vao.render(mode=moderngl.POINTS, vertices=last_visible_count)
         pygame.display.flip()
 
+    equator_vbo.release()
+    pole_vbo.release()
+    equator_vao.release()
+    pole_vao.release()
+    line_prog.release()
     vbo.release()
     vao.release()
     prog.release()
