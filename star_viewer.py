@@ -20,6 +20,10 @@ POINT_SIZE_MIN = 1.0
 POINT_SIZE_MAX = 4.0
 ALPHA_MIN = 0.15
 ALPHA_MAX = 1.0
+MOVE_SPEED_LY_PER_SEC = 50.0
+PARSEC_TO_LIGHTYEAR = 3.26156
+MOVE_SPEED = MOVE_SPEED_LY_PER_SEC / PARSEC_TO_LIGHTYEAR
+MIN_RENDER_DISTANCE_PC = 0.05
 
 VERTEX_SHADER = """
 #version 330
@@ -78,7 +82,7 @@ def load_star_data(limit=MAX_STARS):
     cur = conn.cursor()
     rows = cur.execute(
         """
-        SELECT x, y, z, hpmag_num, color_r, color_g, color_b
+        SELECT x, y, z, distance_pc, hpmag_num, color_r, color_g, color_b
         FROM stars
         WHERE has_valid_3d = 1
           AND x IS NOT NULL AND y IS NOT NULL AND z IS NOT NULL
@@ -96,15 +100,17 @@ def load_star_data(limit=MAX_STARS):
         raise RuntimeError("No valid 3D stars found in database")
 
     positions = arr[:, :3]
-    magnitudes = arr[:, 3]
-    base_colors = arr[:, 4:7]
+    home_distance_pc = arr[:, 3]
+    magnitudes = arr[:, 4]
+    base_colors = arr[:, 5:8]
 
     radii = np.linalg.norm(positions, axis=1)
     finite = radii[np.isfinite(radii) & (radii > 0)]
     median_r = float(np.median(finite)) if len(finite) else 1.0
     scale = 30.0 / median_r if median_r > 0 else 1.0
     positions *= scale
-    return np.ascontiguousarray(positions), np.ascontiguousarray(magnitudes), np.ascontiguousarray(base_colors)
+    home_distance_pc *= scale
+    return np.ascontiguousarray(positions), np.ascontiguousarray(home_distance_pc), np.ascontiguousarray(magnitudes), np.ascontiguousarray(base_colors)
 
 
 def style_from_magnitude(magnitudes, base_colors):
@@ -131,7 +137,7 @@ def normalize(v):
     return v / n
 
 
-def camera_matrix(yaw_deg, pitch_deg):
+def orientation_matrix(yaw_deg, pitch_deg):
     yaw = math.radians(yaw_deg)
     pitch = math.radians(pitch_deg)
 
@@ -152,8 +158,32 @@ def camera_matrix(yaw_deg, pitch_deg):
         [right[0], up[0], -forward[0], 0.0],
         [right[1], up[1], -forward[1], 0.0],
         [right[2], up[2], -forward[2], 0.0],
-        [0.0,      0.0,    0.0,         1.0],
+        [0.0,      0.0,   0.0,         1.0],
     ], dtype='f4')
+    return view
+
+
+def camera_matrix(yaw_deg, pitch_deg, observer_pos):
+    view = orientation_matrix(yaw_deg, pitch_deg).copy()
+    yaw = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+    world_up = np.array([0.0, 1.0, 0.0], dtype='f4')
+    forward = np.array([
+        math.sin(yaw) * math.cos(pitch),
+        math.sin(pitch),
+        -math.cos(yaw) * math.cos(pitch),
+    ], dtype='f4')
+    forward = normalize(forward)
+    right = normalize(np.cross(forward, world_up))
+    if np.linalg.norm(right) < 1e-6:
+        right = np.array([1.0, 0.0, 0.0], dtype='f4')
+    up = normalize(np.cross(right, forward))
+    tx = -float(np.dot(right, observer_pos))
+    ty = -float(np.dot(up, observer_pos))
+    tz = float(np.dot(forward, observer_pos))
+    view[3, 0] = tx
+    view[3, 1] = ty
+    view[3, 2] = tz
     return view
 
 
@@ -220,9 +250,36 @@ def build_guide_geometry():
     return equator_data.astype('f4'), pole_data.astype('f4')
 
 
+def movement_basis(yaw_deg, pitch_deg):
+    yaw = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+    world_up = np.array([0.0, 1.0, 0.0], dtype='f4')
+    forward = np.array([
+        math.sin(yaw) * math.cos(pitch),
+        math.sin(pitch),
+        -math.cos(yaw) * math.cos(pitch),
+    ], dtype='f4')
+    forward = normalize(forward)
+    right = normalize(np.cross(forward, world_up))
+    if np.linalg.norm(right) < 1e-6:
+        right = np.array([1.0, 0.0, 0.0], dtype='f4')
+    up = normalize(np.cross(right, forward))
+    return forward, right, up
+
+
+def apparent_magnitudes_from_observer(base_magnitudes, home_distance_pc, positions, observer_pos):
+    rel = positions - observer_pos
+    current_distance = np.linalg.norm(rel, axis=1)
+    current_distance = np.maximum(current_distance, MIN_RENDER_DISTANCE_PC)
+    home_distance = np.maximum(home_distance_pc, MIN_RENDER_DISTANCE_PC)
+    delta_mag = 5.0 * np.log10(current_distance / home_distance)
+    return base_magnitudes + delta_mag
+
+
 def main():
-    positions, magnitudes, base_colors = load_star_data()
-    point_sizes, colors = style_from_magnitude(magnitudes, base_colors)
+    positions, home_distance_pc, magnitudes, base_colors = load_star_data()
+    apparent_magnitudes = magnitudes.copy()
+    point_sizes, colors = style_from_magnitude(apparent_magnitudes, base_colors)
 
     pygame.init()
     pygame.display.set_caption(f"Hipparcos Star Viewer - mag <= {INITIAL_MAG_LIMIT:.1f}")
@@ -271,13 +328,14 @@ def main():
 
     yaw = 0.0
     pitch = 0.0
+    observer_pos = np.array([0.0, 0.0, 0.0], dtype='f4')
     mag_limit = INITIAL_MAG_LIMIT
     last_visible_count = int(np.count_nonzero(visible))
     clock = pygame.time.Clock()
     running = True
 
     while running:
-        clock.tick(120)
+        dt = clock.tick(120) / 1000.0
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -290,12 +348,37 @@ def main():
                 elif event.key == pygame.K_RIGHTBRACKET:
                     mag_limit = min(MAX_MAG_LIMIT, mag_limit + 1.0)
                     pygame.display.set_caption(f"Hipparcos Star Viewer - mag <= {mag_limit:.1f}")
+                elif event.key == pygame.K_HOME:
+                    observer_pos[:] = 0.0
+                    apparent_magnitudes = magnitudes.copy()
+                    point_sizes, colors = style_from_magnitude(apparent_magnitudes, base_colors)
+                    last_visible_count = -1
 
         mx, my = pygame.mouse.get_rel()
         yaw = (yaw + mx * MOUSE_SENSITIVITY) % 360.0
         pitch = max(-89.9, min(89.9, pitch - my * MOUSE_SENSITIVITY))
 
-        visible = magnitudes <= mag_limit
+        keys = pygame.key.get_pressed()
+        forward, right, up = movement_basis(yaw, pitch)
+        move = np.array([0.0, 0.0, 0.0], dtype='f4')
+        if keys[pygame.K_w]:
+            move += forward
+        if keys[pygame.K_s]:
+            move -= forward
+        if keys[pygame.K_d]:
+            move += right
+        if keys[pygame.K_a]:
+            move -= right
+        if keys[pygame.K_e]:
+            move += up
+        if keys[pygame.K_q]:
+            move -= up
+        if np.linalg.norm(move) > 0:
+            observer_pos += normalize(move) * (MOVE_SPEED * dt)
+            apparent_magnitudes = apparent_magnitudes_from_observer(magnitudes, home_distance_pc, positions, observer_pos)
+            point_sizes, colors = style_from_magnitude(apparent_magnitudes, base_colors)
+
+        visible = apparent_magnitudes <= mag_limit
         visible_count = int(np.count_nonzero(visible))
         if visible_count != last_visible_count:
             current_data = build_interleaved(positions[visible], colors[visible], point_sizes[visible])
@@ -303,14 +386,15 @@ def main():
             vbo.write(current_data.tobytes())
             last_visible_count = visible_count
 
-        view = camera_matrix(yaw, pitch)
+        view = camera_matrix(yaw, pitch, observer_pos)
         view_bytes = view.astype('f4').tobytes()
         prog['u_view'].write(view_bytes)
-        line_prog['u_view'].write(view_bytes)
+        line_prog['u_view'].write(orientation_matrix(yaw, pitch).astype('f4').tobytes())
 
         ctx.clear(0.0, 0.0, 0.0, 1.0)
-        equator_vao.render(mode=moderngl.LINE_STRIP)
-        pole_vao.render(mode=moderngl.LINES)
+        if np.linalg.norm(observer_pos) < 1e-6:
+            equator_vao.render(mode=moderngl.LINE_STRIP)
+            pole_vao.render(mode=moderngl.LINES)
         if last_visible_count > 0:
             vao.render(mode=moderngl.POINTS, vertices=last_visible_count)
         pygame.display.flip()
