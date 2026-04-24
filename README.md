@@ -11,10 +11,13 @@ Current viewer features:
 - Mouse-look camera with stable no-roll sky-view behavior
 - Temperature-derived per-star RGB color
 - Magnitude cutoff control with `[` and `]`
+- Mouse-wheel controlled travel speed
+- Small center reticle and speed indicator HUD rendered in the GL pipeline
 - Default visible magnitude limit of **9.0**
 - Brighter stars rendered larger and more opaque than dimmer stars
 - Faint galactic reference overlay: galactic equator plus north/south galactic pole markers
 - Galactic reference overlay is shown only at the home/Earth position
+- Point-only star rendering (the experimental close-range sphere system was removed)
 - Data filtered to a higher-confidence 3D subset for position rendering
 
 ## Source data
@@ -216,7 +219,9 @@ The viewer:
 - uses `hpmag_num` to control visibility and visual styling
 - uses `color_r`, `color_g`, `color_b` for per-star color
 - uses a stable no-roll mouse-look camera centered at the origin
+- supports manual 3D travel with wheel-controlled speed
 - draws a subtle galactic reference overlay
+- draws a center reticle and a speed HUD through the GL pipeline
 
 ### Magnitude visibility control
 The viewer starts with magnitude limit **9.0**.
@@ -226,6 +231,7 @@ Controls:
 - `[` decreases the visible magnitude limit (shows only brighter stars)
 - `W / A / S / D` move through space
 - `E / Q` move up / down
+- mouse wheel adjusts travel speed
 - `Home` returns instantly to the startup/home position
 - `Esc` exits
 
@@ -236,6 +242,8 @@ The viewer uses `hpmag_num` to map stars visually:
 - dimmer stars appear smaller and fainter
 
 The magnitude range is clamped and compressed for visual clarity so the display is more useful than a literal raw mapping.
+
+As the observer moves away from the home position, apparent magnitudes are updated from the current observer position using a distance-based delta relative to the Earth/home baseline magnitude.
 
 ### Color styling
 The viewer uses the derived database RGB values so stars are tinted by estimated stellar color/temperature.
@@ -266,10 +274,10 @@ This is currently a visualization-first build, not a full scientific analysis pi
 - using Earth-centered apparent magnitudes for display
 
 ## Suggested future improvements
-- add an on-screen HUD for current magnitude limit
+- add an on-screen HUD for current magnitude limit and target star information
 - improve the galactic guide overlay labels / markers
 - add labels or info on selected stars
-- allow free movement through space
+- further tune speed scaling / travel UX
 - add LOD / precomputed magnitude tiers for even faster updates
 - add export scripts for game-engine or WebGL pipelines
 

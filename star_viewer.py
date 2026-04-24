@@ -6,7 +6,7 @@ import moderngl
 import numpy as np
 import pygame
 from pygame.locals import DOUBLEBUF, FULLSCREEN, OPENGL
-from pyrr import Matrix44
+from pyrr import Matrix44, Vector3
 
 DB_PATH = Path(r"D:\OC\spaceSim\hipparcos.db")
 MAX_STARS = 60000
@@ -22,8 +22,13 @@ ALPHA_MIN = 0.15
 ALPHA_MAX = 1.0
 MOVE_SPEED_LY_PER_SEC = 50.0
 PARSEC_TO_LIGHTYEAR = 3.26156
-MOVE_SPEED = MOVE_SPEED_LY_PER_SEC / PARSEC_TO_LIGHTYEAR
+KM_PER_PC = 3.085677581e13
+DEFAULT_MOVE_SPEED_PC = MOVE_SPEED_LY_PER_SEC / PARSEC_TO_LIGHTYEAR
+MIN_MOVE_SPEED_PC = 1e-10
+MAX_MOVE_SPEED_PC = 1000.0
 MIN_RENDER_DISTANCE_PC = 0.05
+RETICLE_SIZE = 8
+HUD_COLOR = (185, 195, 220, 150)
 
 VERTEX_SHADER = """
 #version 330
@@ -75,6 +80,28 @@ void main() {
     f_color = v_color;
 }
 """
+
+HUD_VERTEX_SHADER = """
+#version 330
+in vec2 in_position;
+in vec2 in_texcoord;
+out vec2 v_texcoord;
+void main() {
+    gl_Position = vec4(in_position, 0.0, 1.0);
+    v_texcoord = in_texcoord;
+}
+"""
+
+HUD_FRAGMENT_SHADER = """
+#version 330
+uniform sampler2D u_tex;
+in vec2 v_texcoord;
+out vec4 f_color;
+void main() {
+    f_color = texture(u_tex, v_texcoord);
+}
+"""
+
 
 
 def load_star_data(limit=MAX_STARS):
@@ -273,7 +300,63 @@ def apparent_magnitudes_from_observer(base_magnitudes, home_distance_pc, positio
     current_distance = np.maximum(current_distance, MIN_RENDER_DISTANCE_PC)
     home_distance = np.maximum(home_distance_pc, MIN_RENDER_DISTANCE_PC)
     delta_mag = 5.0 * np.log10(current_distance / home_distance)
-    return base_magnitudes + delta_mag
+    return base_magnitudes + delta_mag, current_distance
+
+
+def format_speed(speed_pc_per_sec):
+    speed_ly = speed_pc_per_sec * PARSEC_TO_LIGHTYEAR
+    if speed_ly >= 0.01:
+        return f"Speed: {speed_ly:,.3f} ly/s"
+    speed_km = speed_pc_per_sec * KM_PER_PC
+    return f"Speed: {speed_km:,.1f} km/s"
+
+
+def adjust_speed(current_speed, direction):
+    factor = 1.35 if direction > 0 else (1.0 / 1.35)
+    new_speed = current_speed * factor
+    return max(MIN_MOVE_SPEED_PC, min(MAX_MOVE_SPEED_PC, new_speed))
+
+
+def build_hud_quad(x0, y0, x1, y1):
+    return np.array([
+        [x0, y0, 0.0, 0.0],
+        [x1, y0, 1.0, 0.0],
+        [x0, y1, 0.0, 1.0],
+        [x1, y1, 1.0, 1.0],
+    ], dtype='f4')
+
+
+def make_hud_texture(ctx, surface):
+    rgba = pygame.image.tostring(surface, 'RGBA', True)
+    tex = ctx.texture(surface.get_size(), 4, rgba)
+    tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    return tex
+
+
+def approach_target_index(positions, observer_pos, yaw_deg, pitch_deg):
+    yaw = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+    forward = np.array([
+        math.sin(yaw) * math.cos(pitch),
+        math.sin(pitch),
+        -math.cos(yaw) * math.cos(pitch),
+    ], dtype='f4')
+    forward = normalize(forward)
+
+    rel = positions - observer_pos
+    distances = np.linalg.norm(rel, axis=1)
+    safe_dist = np.maximum(distances, MIN_RENDER_DISTANCE_PC)
+    dirs = rel / safe_dist[:, None]
+    alignment = dirs @ forward
+
+    mask = alignment > 0.98
+    if np.any(mask):
+        candidate_idx = np.where(mask)[0]
+        score = alignment[mask] / safe_dist[mask]
+        return int(candidate_idx[np.argmax(score)])
+
+    score = alignment / safe_dist
+    return int(np.argmax(score))
 
 
 def main():
@@ -284,10 +367,11 @@ def main():
     pygame.init()
     pygame.display.set_caption(f"Hipparcos Star Viewer - mag <= {INITIAL_MAG_LIMIT:.1f}")
     info = pygame.display.Info()
+    hud_font = pygame.font.SysFont('Segoe UI', 18)
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
-    pygame.display.set_mode((info.current_w, info.current_h), FULLSCREEN | DOUBLEBUF | OPENGL)
+    screen = pygame.display.set_mode((info.current_w, info.current_h), FULLSCREEN | DOUBLEBUF | OPENGL)
 
     ctx = moderngl.create_context()
     ctx.enable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
@@ -296,6 +380,7 @@ def main():
 
     prog = ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
     line_prog = ctx.program(vertex_shader=LINE_VERTEX_SHADER, fragment_shader=LINE_FRAGMENT_SHADER)
+    hud_prog = ctx.program(vertex_shader=HUD_VERTEX_SHADER, fragment_shader=HUD_FRAGMENT_SHADER)
 
     visible = magnitudes <= INITIAL_MAG_LIMIT
     current_data = build_interleaved(positions[visible], colors[visible], point_sizes[visible])
@@ -330,7 +415,9 @@ def main():
     pitch = 0.0
     observer_pos = np.array([0.0, 0.0, 0.0], dtype='f4')
     mag_limit = INITIAL_MAG_LIMIT
+    current_speed = DEFAULT_MOVE_SPEED_PC
     last_visible_count = int(np.count_nonzero(visible))
+    current_distance = np.linalg.norm(positions - observer_pos, axis=1)
     clock = pygame.time.Clock()
     running = True
 
@@ -339,6 +426,8 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.MOUSEWHEEL:
+                current_speed = adjust_speed(current_speed, event.y)
             elif event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     running = False
@@ -351,6 +440,7 @@ def main():
                 elif event.key == pygame.K_HOME:
                     observer_pos[:] = 0.0
                     apparent_magnitudes = magnitudes.copy()
+                    current_distance = np.linalg.norm(positions - observer_pos, axis=1)
                     point_sizes, colors = style_from_magnitude(apparent_magnitudes, base_colors)
                     last_visible_count = -1
 
@@ -373,17 +463,23 @@ def main():
             move += up
         if keys[pygame.K_q]:
             move -= up
+        target_idx = approach_target_index(positions, observer_pos, yaw, pitch)
+        target_distance = float(current_distance[target_idx])
         if np.linalg.norm(move) > 0:
-            observer_pos += normalize(move) * (MOVE_SPEED * dt)
-            apparent_magnitudes = apparent_magnitudes_from_observer(magnitudes, home_distance_pc, positions, observer_pos)
+            move_dir = normalize(move)
+            step = current_speed * dt
+            observer_pos += move_dir * step
+            apparent_magnitudes, current_distance = apparent_magnitudes_from_observer(magnitudes, home_distance_pc, positions, observer_pos)
             point_sizes, colors = style_from_magnitude(apparent_magnitudes, base_colors)
 
         visible = apparent_magnitudes <= mag_limit
         visible_count = int(np.count_nonzero(visible))
+
         if visible_count != last_visible_count:
             current_data = build_interleaved(positions[visible], colors[visible], point_sizes[visible])
-            vbo.orphan(size=current_data.nbytes)
-            vbo.write(current_data.tobytes())
+            vbo.orphan(size=max(current_data.nbytes, 1))
+            if current_data.nbytes:
+                vbo.write(current_data.tobytes())
             last_visible_count = visible_count
 
         view = camera_matrix(yaw, pitch, observer_pos)
@@ -397,8 +493,36 @@ def main():
             pole_vao.render(mode=moderngl.LINES)
         if last_visible_count > 0:
             vao.render(mode=moderngl.POINTS, vertices=last_visible_count)
+
+        overlay = pygame.Surface((info.current_w, info.current_h), pygame.SRCALPHA)
+        cx = info.current_w // 2
+        cy = info.current_h // 2
+        pygame.draw.line(overlay, (180, 200, 240, 180), (cx - RETICLE_SIZE, cy), (cx + RETICLE_SIZE, cy), 1)
+        pygame.draw.line(overlay, (180, 200, 240, 180), (cx, cy - RETICLE_SIZE), (cx, cy + RETICLE_SIZE), 1)
+        hud_surface = hud_font.render(format_speed(current_speed), True, HUD_COLOR[:3])
+        hud_surface.set_alpha(HUD_COLOR[3])
+        text_x = info.current_w - hud_surface.get_width() - 18
+        text_y = 14
+        overlay.blit(hud_surface, (text_x, text_y))
+
+        hud_tex = make_hud_texture(ctx, overlay)
+        hud_tex.use(0)
+        hud_prog['u_tex'].value = 0
+        hud_quad = build_hud_quad(-1.0, -1.0, 1.0, 1.0)
+        hud_vbo = ctx.buffer(hud_quad.tobytes())
+        hud_vao = ctx.vertex_array(
+            hud_prog,
+            [(hud_vbo, '2f 2f', 'in_position', 'in_texcoord')],
+        )
+        ctx.disable(moderngl.DEPTH_TEST)
+        ctx.enable(moderngl.BLEND)
+        hud_vao.render(mode=moderngl.TRIANGLE_STRIP)
+        hud_vao.release()
+        hud_vbo.release()
+        hud_tex.release()
         pygame.display.flip()
 
+    hud_prog.release()
     equator_vbo.release()
     pole_vbo.release()
     equator_vao.release()
