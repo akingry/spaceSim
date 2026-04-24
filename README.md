@@ -14,6 +14,7 @@ Current viewer features:
 - Default visible magnitude limit of **9.0**
 - Brighter stars rendered larger and more opaque than dimmer stars
 - Faint galactic reference overlay: galactic equator plus north/south galactic pole markers
+- Galactic reference overlay is shown only at the home/Earth position
 - Data filtered to a higher-confidence 3D subset for position rendering
 
 ## Source data
@@ -223,7 +224,10 @@ The viewer starts with magnitude limit **9.0**.
 Controls:
 - `]` increases the visible magnitude limit (shows dimmer stars too)
 - `[` decreases the visible magnitude limit (shows only brighter stars)
-- `Esc` or `Q` exits
+- `W / A / S / D` move through space
+- `E / Q` move up / down
+- `Home` returns instantly to the startup/home position
+- `Esc` exits
 
 ### Brightness / size styling
 The viewer uses `hpmag_num` to map stars visually:
@@ -243,6 +247,8 @@ The viewer also draws a very subtle dark-blue galactic reference overlay consist
 - a south galactic pole marker
 
 These are intentionally faint so they help orient the viewer without dominating the star field.
+
+Because these guides are meant to represent the sky as seen from Earth/home position, they are shown only when the observer is at the home position. Once the viewer moves away from home, the guide overlay disappears.
 
 ## Main dependencies
 This project currently depends on Python packages available in the local environment, including:
