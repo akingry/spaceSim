@@ -4,11 +4,11 @@ A local Python/OpenGL star viewer built from a merged **Hipparcos + Gaia** stell
 
 The project has two halves:
 - a data pipeline that builds local SQLite catalogs from Hipparcos and a Gaia Sky / Gaia DR3-derived extract
-- a fullscreen interactive viewer for flying through the resulting 3D star field
+- a fullscreen interactive viewer for flying through a large local 3D star field
 
 ## Current status
 
-The data pipeline is in good shape and the merged catalog is being generated successfully.
+The data pipeline is working and the merged catalog is being generated successfully.
 
 Current local merged dataset:
 - **646,451** total stars
@@ -19,7 +19,7 @@ Current local merged dataset:
 - **51** Hipparcos-only rows
 - **588,754** stars flagged as valid 3D
 
-The viewer is mid-integration after recent radius/sphere-rendering work. The README documents the intended architecture and controls, but the current branch should be treated as **active development**, not a polished release.
+The viewer is actively being tuned, especially the close-approach / goto-star experience. Core navigation, inspection, merged naming, and radius-aware target rendering are in place, but the app should still be considered **active development** rather than a polished release.
 
 ## Highlights
 
@@ -29,8 +29,8 @@ The viewer is mid-integration after recent radius/sphere-rendering work. The REA
 - Magnitude-based visibility filtering
 - Mouse-look flight controls with adjustable speed
 - Inspect mode with star info panel
-- Goto mode for traveling to a selected star
-- Derived stellar temperatures, colors, luminosities, and render-safe radii
+- Goto mode for selecting a star, gently centering on it, and traveling toward it
+- Radius-aware close target rendering using derived stellar radii
 - Separate Gaia extract staging area to avoid mutating the live DB during parsing
 
 ## Repository layout
@@ -172,12 +172,22 @@ python star_viewer.py
 - `[` / `]` — decrease/increase visible magnitude limit
 - right click — toggle inspect mode
 - left click (inspect mode) — select a star
-- `G` — begin goto mode for selected star
+- `G` — start goto mode for the selected star
 - `H` — toggle info panel
 - `Home` — return to the home/origin position
 - `Esc` — quit
 
-### Intended viewer behavior
+### Current goto behavior
+
+Goto mode currently aims to:
+- gently pan the camera onto the selected target before forward motion begins
+- travel toward the selected star rather than just pointing at it
+- switch to a useful local travel speed on arrival (**200,000 km/s**)
+- render the goto target separately from the normal point-star field so close approach can be visualized
+
+This part of the app is still under active tuning.
+
+### General viewer behavior
 
 The viewer is designed to:
 - render stars from the merged database
@@ -185,7 +195,7 @@ The viewer is designed to:
 - show a subtle galactic reference overlay while at the home position
 - label nearby stars using merged naming priority
 - show a star info panel in inspect mode
-- render the goto target as a sphere during close approach
+- support close target rendering for the currently selected goto star
 
 ## Dependencies
 
@@ -228,11 +238,12 @@ Practical compromises include:
 - radius estimation from magnitude + temperature
 - class-based radius fallback/clamping for render stability
 - apparent magnitude recomputation relative to the current observer position
+- ongoing tuning of the close-approach / goto-star rendering path
 
 ## Roadmap
 
 Likely next improvements:
-- finish the current radius-aware sphere rendering integration
+- finish stabilizing the close-approach sphere rendering path
 - improve multiple-star companion detection
 - add a search UI for stars by name / identifier
 - expose raw vs clamped radius in the info panel

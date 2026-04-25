@@ -44,7 +44,15 @@ PANEL_MUTED = (135, 150, 178)
 PANEL_ACCENT = (155, 205, 255)
 GOTO_SPEED_LY_PER_SEC = 5.0
 GOTO_SPEED_PC = GOTO_SPEED_LY_PER_SEC / PARSEC_TO_LIGHTYEAR
-GOTO_STOP_DISTANCE_PC = 0.02
+GOTO_STOP_RADIUS_MULTIPLIER = 4.0
+GOTO_MIN_STOP_DISTANCE_PC = 1e-8
+GOTO_MIN_NEAR_PLANE = 1e-9
+DEFAULT_NEAR_PLANE = 0.01
+GOTO_ALIGN_YAW_DEG_PER_SEC = 45.0
+GOTO_ALIGN_PITCH_DEG_PER_SEC = 30.0
+GOTO_ALIGN_TOLERANCE_DEG = 0.2
+GOTO_ARRIVAL_SPEED_KM_PER_SEC = 200000.0
+GOTO_ARRIVAL_SPEED_PC = GOTO_ARRIVAL_SPEED_KM_PER_SEC / KM_PER_PC
 COMPANION_RADIUS_LY = 0.5
 MAX_COMPANION_SPHERES = 8
 SPHERE_MIN_RADIUS_PC = 0.0
@@ -215,11 +223,11 @@ def load_star_data(limit=MAX_STARS):
     if not rows:
         raise RuntimeError("No valid 3D stars found in merged database")
 
-    positions = np.array([[row["x"], row["y"], row["z"]] for row in rows], dtype=np.float32)
-    home_distance_pc = np.array([row["distance_pc"] for row in rows], dtype=np.float32)
-    magnitudes = np.array([row["merged_apparent_magnitude"] for row in rows], dtype=np.float32)
+    positions = np.array([[row["x"], row["y"], row["z"]] for row in rows], dtype=np.float64)
+    home_distance_pc = np.array([row["distance_pc"] for row in rows], dtype=np.float64)
+    magnitudes = np.array([row["merged_apparent_magnitude"] for row in rows], dtype=np.float64)
     base_colors = np.array([[row["color_r"], row["color_g"], row["color_b"]] for row in rows], dtype=np.float32)
-    physical_radii_pc = np.array([max(float(row["radius_rsun"]) * R_SUN_PC, SPHERE_MIN_RADIUS_PC) for row in rows], dtype=np.float32)
+    physical_radii_pc = np.array([max(float(row["radius_rsun"]) * R_SUN_PC, SPHERE_MIN_RADIUS_PC) for row in rows], dtype=np.float64)
     labels = np.array([choose_display_name(row) for row in rows], dtype=object)
     star_records = rows
 
@@ -411,29 +419,72 @@ def build_target_group(target_idx, positions, home_distance_pc):
     return [target_idx] + ordered
 
 
+def goto_stop_distance_pc(target_idx, physical_radii_pc):
+    if target_idx is None:
+        return GOTO_MIN_STOP_DISTANCE_PC
+    radius_pc = float(physical_radii_pc[target_idx]) if target_idx < len(physical_radii_pc) else 0.0
+    if not math.isfinite(radius_pc) or radius_pc <= 0.0:
+        radius_pc = 0.0
+    return max(radius_pc * GOTO_STOP_RADIUS_MULTIPLIER, GOTO_MIN_STOP_DISTANCE_PC)
+
+
+def goto_near_plane_pc(target_idx, physical_radii_pc):
+    stop_distance = goto_stop_distance_pc(target_idx, physical_radii_pc)
+    return min(DEFAULT_NEAR_PLANE, max(GOTO_MIN_NEAR_PLANE, stop_distance * 0.25))
+
+
+def look_angles_to_target(observer_pos, target_pos):
+    delta = target_pos - observer_pos
+    distance = float(np.linalg.norm(delta))
+    if distance <= 0.0:
+        return None
+    dx, dy, dz = float(delta[0]), float(delta[1]), float(delta[2])
+    yaw_deg = math.degrees(math.atan2(dx, -dz)) % 360.0
+    horizontal = math.sqrt(dx * dx + dz * dz)
+    pitch_deg = math.degrees(math.atan2(dy, horizontal))
+    return yaw_deg, max(-89.9, min(89.9, pitch_deg))
+
+
+def angle_delta_deg(current, target):
+    return (target - current + 180.0) % 360.0 - 180.0
+
+
+def step_toward_angle(current, target, max_step):
+    delta = angle_delta_deg(current, target)
+    if abs(delta) <= max_step:
+        return target % 360.0, True
+    return (current + math.copysign(max_step, delta)) % 360.0, False
+
+
+def step_toward_value(current, target, max_step):
+    delta = target - current
+    if abs(delta) <= max_step:
+        return target, True
+    return current + math.copysign(max_step, delta), False
+
+
 def render_visible_spheres(ctx, sphere_prog, sphere_vao, projection_bytes, view_bytes, instance_count):
     if instance_count <= 0:
         return
+    ctx.disable(moderngl.CULL_FACE)
     ctx.disable(moderngl.BLEND)
-    ctx.enable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
+    ctx.enable(moderngl.DEPTH_TEST)
     sphere_prog['u_projection'].write(projection_bytes)
     sphere_prog['u_view'].write(view_bytes)
     sphere_prog['u_light_dir'].value = (0.35, 0.8, 0.45)
     sphere_vao.render(mode=moderngl.TRIANGLES, instances=instance_count)
 
 
-def render_star_spheres(ctx, sphere_prog, sphere_vbo, sphere_ibo, projection_bytes, view_bytes, group_indices, target_idx, observer_pos, positions, base_colors, physical_radii_pc):
-    if not group_indices:
+def render_star_spheres(ctx, sphere_prog, sphere_vbo, sphere_ibo, projection_bytes, orientation_bytes, group_indices, target_idx, observer_pos, positions, base_colors, physical_radii_pc):
+    if not group_indices or target_idx is None:
         return
 
-    target_distance = float(np.linalg.norm(positions[target_idx] - observer_pos)) if target_idx is not None else 0.0
-    boost = 1.0 + 0.12 / max(target_distance, 0.02)
-
-    centers = positions[group_indices].astype('f4')
+    target_radius = max(float(physical_radii_pc[target_idx]), 1e-12)
+    relative_centers = ((positions[group_indices] - observer_pos) / target_radius).astype('f4')
     colors = np.clip(base_colors[group_indices], 0.0, 1.0).astype('f4')
-    radii = np.maximum(physical_radii_pc[group_indices].astype('f4'), 1e-7) * boost
+    radii = np.maximum((physical_radii_pc[group_indices] / target_radius).astype('f4'), 1e-6)
 
-    instance_data = build_instance_data(centers, colors, radii)
+    instance_data = build_instance_data(relative_centers, colors, radii)
     instance_vbo = ctx.buffer(instance_data.tobytes())
     vao = ctx.vertex_array(
         sphere_prog,
@@ -444,7 +495,7 @@ def render_star_spheres(ctx, sphere_prog, sphere_vbo, sphere_ibo, projection_byt
         index_buffer=sphere_ibo,
     )
     try:
-        render_visible_spheres(ctx, sphere_prog, vao, projection_bytes, view_bytes, len(group_indices))
+        render_visible_spheres(ctx, sphere_prog, vao, projection_bytes, orientation_bytes, len(group_indices))
     finally:
         vao.release()
         instance_vbo.release()
@@ -469,11 +520,11 @@ def movement_basis(yaw_deg, pitch_deg):
 
 def apparent_magnitudes_from_observer(base_magnitudes, home_distance_pc, positions, observer_pos):
     rel = positions - observer_pos
-    current_distance = np.linalg.norm(rel, axis=1)
-    current_distance = np.maximum(current_distance, MIN_RENDER_DISTANCE_PC)
+    true_distance = np.linalg.norm(rel, axis=1)
+    render_distance = np.maximum(true_distance, MIN_RENDER_DISTANCE_PC)
     home_distance = np.maximum(home_distance_pc, MIN_RENDER_DISTANCE_PC)
-    delta_mag = 5.0 * np.log10(current_distance / home_distance)
-    return base_magnitudes + delta_mag, current_distance
+    delta_mag = 5.0 * np.log10(render_distance / home_distance)
+    return base_magnitudes + delta_mag, true_distance, render_distance
 
 
 def format_speed(speed_pc_per_sec):
@@ -672,10 +723,27 @@ def main():
     sphere_vao = ctx.vertex_array(sphere_prog, [(sphere_vbo, '3f 3f', 'in_position', 'in_normal')], index_buffer=sphere_ibo)
     sphere_index_count = len(sphere_indices)
 
-    projection = Matrix44.perspective_projection(75.0, info.current_w / max(info.current_h, 1), 0.01, 1000.0, dtype='f4')
-    proj_bytes = projection.astype('f4').tobytes()
-    prog['u_projection'].write(proj_bytes)
-    line_prog['u_projection'].write(proj_bytes)
+    aspect = info.current_w / max(info.current_h, 1)
+
+    def rebuild_projection(near_plane):
+        projection = Matrix44.perspective_projection(75.0, aspect, near_plane, 1000.0, dtype='f4')
+        proj_bytes = projection.astype('f4').tobytes()
+        prog['u_projection'].write(proj_bytes)
+        line_prog['u_projection'].write(proj_bytes)
+        return projection, proj_bytes
+
+    def build_sphere_projection(target_idx):
+        if target_idx is None:
+            projection = Matrix44.perspective_projection(75.0, aspect, 0.05, 1000.0, dtype='f4')
+            return projection.astype('f4').tobytes()
+        target_radius = max(float(physical_radii_pc[target_idx]), 1e-12)
+        relative = positions[goto_group_indices] - observer_pos if goto_group_indices else (positions[[target_idx]] - observer_pos)
+        far_units = float(np.max(np.linalg.norm(relative, axis=1)) / target_radius) + 10.0
+        far_plane = max(50.0, min(far_units, 500000.0))
+        projection = Matrix44.perspective_projection(75.0, aspect, 0.05, far_plane, dtype='f4')
+        return projection.astype('f4').tobytes()
+
+    projection, proj_bytes = rebuild_projection(DEFAULT_NEAR_PLANE)
 
     inspect_mode = False
     selected_star_idx = None
@@ -690,18 +758,22 @@ def main():
 
     yaw = 0.0
     pitch = 0.0
-    observer_pos = np.array([0.0, 0.0, 0.0], dtype='f4')
+    observer_pos = np.array([0.0, 0.0, 0.0], dtype=np.float64)
     mag_limit = INITIAL_MAG_LIMIT
     current_speed = DEFAULT_MOVE_SPEED_PC
     goto_speed_pc = GOTO_SPEED_PC
     pre_goto_speed = current_speed
+    goto_aligning = False
     last_visible_count = int(np.count_nonzero(visible))
-    current_distance = np.linalg.norm(positions - observer_pos, axis=1)
+    current_distance_true = np.linalg.norm(positions - observer_pos, axis=1)
+    current_distance_render = np.maximum(current_distance_true, MIN_RENDER_DISTANCE_PC)
     clock = pygame.time.Clock()
     running = True
 
     while running:
         dt = clock.tick(120) / 1000.0
+        active_near_plane = goto_near_plane_pc(goto_target_idx, physical_radii_pc) if goto_target_idx is not None else DEFAULT_NEAR_PLANE
+        projection, proj_bytes = rebuild_projection(active_near_plane)
         view = camera_matrix(yaw, pitch, observer_pos)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -714,7 +786,7 @@ def main():
                     pygame.mouse.get_rel()
                 elif event.button == 1 and inspect_mode:
                     projection_np = np.array(projection, dtype='f4')
-                    picked = pick_star(event.pos, positions, current_distance, visible, view, projection_np, info.current_w, info.current_h)
+                    picked = pick_star(event.pos, positions, current_distance_true, visible, view, projection_np, info.current_w, info.current_h)
                     if picked is not None:
                         selected_star_idx = picked
             elif event.type == pygame.MOUSEWHEEL:
@@ -731,9 +803,11 @@ def main():
                 elif event.key == pygame.K_HOME:
                     observer_pos[:] = 0.0
                     apparent_magnitudes = magnitudes.copy()
-                    current_distance = np.linalg.norm(positions - observer_pos, axis=1)
+                    current_distance_true = np.linalg.norm(positions - observer_pos, axis=1)
+                    current_distance_render = np.maximum(current_distance_true, MIN_RENDER_DISTANCE_PC)
                     point_sizes, colors = style_from_magnitude(apparent_magnitudes, base_colors)
                     goto_active = False
+                    goto_aligning = False
                     goto_target_idx = None
                     goto_group_indices = []
                     current_speed = pre_goto_speed
@@ -743,7 +817,8 @@ def main():
                 elif event.key == pygame.K_g and selected_star_idx is not None:
                     goto_target_idx = selected_star_idx
                     goto_group_indices = build_target_group(goto_target_idx, positions, home_distance_pc)
-                    goto_active = True
+                    goto_aligning = True
+                    goto_active = False
                     pre_goto_speed = current_speed
                     current_speed = goto_speed_pc
 
@@ -751,19 +826,37 @@ def main():
         yaw = (yaw + mx * MOUSE_SENSITIVITY) % 360.0
         pitch = max(-89.9, min(89.9, pitch - my * MOUSE_SENSITIVITY))
 
+        if goto_target_idx is not None and (goto_active or goto_aligning):
+            angles = look_angles_to_target(observer_pos, positions[goto_target_idx])
+            if angles is not None:
+                target_yaw, target_pitch = angles
+                yaw_step = GOTO_ALIGN_YAW_DEG_PER_SEC * dt
+                pitch_step = GOTO_ALIGN_PITCH_DEG_PER_SEC * dt
+                yaw, yaw_done = step_toward_angle(yaw, target_yaw, yaw_step)
+                pitch, pitch_done = step_toward_value(pitch, target_pitch, pitch_step)
+                pitch = max(-89.9, min(89.9, pitch))
+                if goto_aligning and yaw_done and pitch_done and abs(angle_delta_deg(yaw, target_yaw)) <= GOTO_ALIGN_TOLERANCE_DEG and abs(pitch - target_pitch) <= GOTO_ALIGN_TOLERANCE_DEG:
+                    goto_aligning = False
+                    goto_active = True
+
         keys = pygame.key.get_pressed()
         forward, right, up = movement_basis(yaw, pitch)
         move = np.array([0.0, 0.0, 0.0], dtype='f4')
         if goto_active and goto_target_idx is not None:
             to_target = positions[goto_target_idx] - observer_pos
             target_distance = float(np.linalg.norm(to_target))
-            if target_distance <= GOTO_STOP_DISTANCE_PC:
+            stop_distance_pc = goto_stop_distance_pc(goto_target_idx, physical_radii_pc)
+            if target_distance <= stop_distance_pc:
                 goto_active = False
-                current_speed = pre_goto_speed
+                current_speed = GOTO_ARRIVAL_SPEED_PC
             elif target_distance > 0:
                 move = normalize(to_target)
-                step = min(goto_speed_pc * dt, max(target_distance - GOTO_STOP_DISTANCE_PC, 0.0))
-                observer_pos += move * step
+                remaining = max(target_distance - stop_distance_pc, 0.0)
+                step = min(goto_speed_pc * dt, remaining)
+                if step >= remaining:
+                    observer_pos = positions[goto_target_idx] - move * stop_distance_pc
+                else:
+                    observer_pos += move * step
         elif not inspect_mode:
             if keys[pygame.K_w]:
                 move += forward
@@ -781,15 +874,18 @@ def main():
                 move_dir = normalize(move)
                 step = current_speed * dt
                 observer_pos += move_dir * step
-        if goto_active or np.linalg.norm(move) > 0:
-            apparent_magnitudes, current_distance = apparent_magnitudes_from_observer(magnitudes, home_distance_pc, positions, observer_pos)
+        if goto_active or goto_aligning or np.linalg.norm(move) > 0:
+            apparent_magnitudes, current_distance_true, current_distance_render = apparent_magnitudes_from_observer(magnitudes, home_distance_pc, positions, observer_pos)
             point_sizes, colors = style_from_magnitude(apparent_magnitudes, base_colors)
 
         visible = apparent_magnitudes <= mag_limit
-        visible_count = int(np.count_nonzero(visible))
+        point_visible = visible.copy()
+        if goto_group_indices:
+            point_visible[np.array(goto_group_indices, dtype=int)] = False
+        visible_count = int(np.count_nonzero(point_visible))
 
         if visible_count != last_visible_count:
-            current_data = build_interleaved(positions[visible], colors[visible], point_sizes[visible])
+            current_data = build_interleaved(positions[point_visible], colors[point_visible], point_sizes[point_visible])
             vbo.orphan(size=max(current_data.nbytes, 1))
             if current_data.nbytes:
                 vbo.write(current_data.tobytes())
@@ -797,8 +893,9 @@ def main():
 
         view = camera_matrix(yaw, pitch, observer_pos)
         view_bytes = view.astype('f4').tobytes()
+        orientation_bytes = orientation_matrix(yaw, pitch).astype('f4').tobytes()
         prog['u_view'].write(view_bytes)
-        line_prog['u_view'].write(orientation_matrix(yaw, pitch).astype('f4').tobytes())
+        line_prog['u_view'].write(orientation_bytes)
 
         ctx.clear(0.0, 0.0, 0.0, 1.0)
         if np.linalg.norm(observer_pos) < 1e-6:
@@ -807,14 +904,15 @@ def main():
         if last_visible_count > 0:
             vao.render(mode=moderngl.POINTS, vertices=last_visible_count)
         if goto_target_idx is not None and goto_group_indices:
-            render_star_spheres(ctx, sphere_prog, sphere_vbo, sphere_ibo, proj_bytes, view_bytes, goto_group_indices, goto_target_idx, observer_pos, positions, base_colors, physical_radii_pc)
+            sphere_proj_bytes = build_sphere_projection(goto_target_idx)
+            render_star_spheres(ctx, sphere_prog, sphere_vbo, sphere_ibo, sphere_proj_bytes, orientation_bytes, goto_group_indices, goto_target_idx, observer_pos, positions, base_colors, physical_radii_pc)
 
         overlay = pygame.Surface((info.current_w, info.current_h), pygame.SRCALPHA)
         cx = info.current_w // 2
         cy = info.current_h // 2
         pygame.draw.line(overlay, (180, 200, 240, 180), (cx - RETICLE_SIZE, cy), (cx + RETICLE_SIZE, cy), 1)
         pygame.draw.line(overlay, (180, 200, 240, 180), (cx, cy - RETICLE_SIZE), (cx, cy + RETICLE_SIZE), 1)
-        label_mask = current_distance * PARSEC_TO_LIGHTYEAR <= LABEL_MAX_DISTANCE_LY
+        label_mask = current_distance_true * PARSEC_TO_LIGHTYEAR <= LABEL_MAX_DISTANCE_LY
         label_indices = np.where(label_mask)[0]
         label_texts = []
         if len(label_indices):
@@ -824,7 +922,7 @@ def main():
                 screen_pos = world_to_screen(positions[idx], view, projection_np, info.current_w, info.current_h)
                 if screen_pos is None:
                     continue
-                label_candidates.append((float(current_distance[idx]), idx, screen_pos))
+                label_candidates.append((float(current_distance_true[idx]), idx, screen_pos))
             label_candidates.sort(key=lambda t: t[0])
             used_rects = []
             for _, idx, (sx, sy) in label_candidates[:MAX_LABELS]:
@@ -838,8 +936,12 @@ def main():
                 label_texts.append((label_surface, rect))
                 used_rects.append(rect)
 
-        if goto_active and goto_target_idx is not None:
+        if goto_aligning and goto_target_idx is not None:
+            mode_text = f"Goto mode — centering on {labels[goto_target_idx]}"
+        elif goto_active and goto_target_idx is not None:
             mode_text = f"Goto mode — cruising to {labels[goto_target_idx]} at {GOTO_SPEED_LY_PER_SEC:.0f} ly/s"
+        elif goto_target_idx is not None:
+            mode_text = f"Arrived at {labels[goto_target_idx]} — right click to inspect, Home to reset"
         else:
             mode_text = 'Inspect mode — right click to return to flight' if inspect_mode else 'Flight mode — right click to inspect stars'
         mode_surface = label_font.render(mode_text, True, HUD_COLOR[:3])
@@ -856,9 +958,9 @@ def main():
             overlay.blit(surf, rect.topleft)
 
         if show_info_panel and selected_star_idx is not None:
-            live_distance_pc = float(current_distance[selected_star_idx]) / render_scale if render_scale else float(current_distance[selected_star_idx])
+            live_distance_pc = float(current_distance_true[selected_star_idx]) / render_scale if render_scale else float(current_distance_true[selected_star_idx])
             draw_star_panel(overlay, panel_title_font, panel_body_font, panel_small_font, star_records[selected_star_idx], live_distance_pc, mode_text)
-            if not goto_active:
+            if not goto_active and not goto_aligning:
                 hint_surface = panel_small_font.render('Press G to go physicalize this star', True, PANEL_ACCENT)
                 overlay.blit(hint_surface, (18 + 16, 18 + 16 + panel_title_font.get_height() + panel_small_font.get_height() + 34))
 
