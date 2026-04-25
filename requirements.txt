@@ -1,0 +1,6 @@
+numpy
+pygame
+moderngl
+pyrr
+astropy
+pyarrow

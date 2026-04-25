@@ -1,0 +1,24 @@
+{
+    "key": "gaia-dr3-best",
+    "name": "Gaia DR3 best",
+    "version": 1,
+    "type": "catalog-gaia",
+    "mingsversion": 3060100,
+    "description": "Star catalog based on Gaia DR3 with only the very best stars in terms of parallax relative error. Contains all stars with up to 0.4%/0.002% bright/faint parallax relative error, and all Hipparcos stars.",
+    "releasenotes": "- Initial version of this dataset.",
+    "link": "https://gaia.ari.uni-heidelberg.de/gaiasky/files/repository",
+    "size": 54472471,
+    "nobjects": 646400,
+    "check": "$data/catalog-gaia-dr3-best/dataset.json",
+    "files": [ "$data/catalog-gaia-dr3-best" ],
+    "data": [
+    {
+        "loader": "gaiasky.data.OctreeLoader",
+        "files": [
+            "$data/catalog-gaia-dr3-best/catalog/gaia-dr3-best/particles/",
+            "$data/catalog-gaia-dr3-best/catalog/gaia-dr3-best/metadata.bin"
+        ],
+        "epoch": 2016
+    }
+    ]
+}

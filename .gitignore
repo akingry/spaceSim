@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# SQLite databases and runtime files
+*.db
+*.db-shm
+*.db-wal
+
+# Raw source catalog downloads / generated local catalogs
+I_311_hip2.dat.gz.fits
+hip7p.dat
+hip9p.dat
+hipvim.dat
+hip_gaia_merged.db
+gaia_extract/data/
+catalog/
+
+# Local scratch / inspection helpers
+_inspect_*.py
+_compare_*.py
+_star_viewer_patch.py
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
